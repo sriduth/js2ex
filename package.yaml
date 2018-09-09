@@ -23,6 +23,7 @@ dependencies:
 - base >= 4.7 && < 5
 - language-javascript >=0.6.0.9 && <0.7
 - text
+- process
 
 library:
   source-dirs: src

@@ -1,8 +1,6 @@
 {-# LANGUAGE OverloadedStrings #-}
 
-module Lib
-    ( someFunc
-    ) where
+module Lib where
 
 import Prelude
 import Language.JavaScript.Parser
@@ -38,6 +36,7 @@ data ExAST
   | Parens ExAST
   | Assignment ExAST ExAST
   | VarIntro ExAST (Maybe ExAST)
+  | ExpList [ExAST]
   deriving (Eq, Show) 
 
 
@@ -142,21 +141,20 @@ js2ex jsAst =
           (Block (js2ex <$> (jsBlockIfElseFlow $ getJsStatementsFromBlock block)))
     --for,lb,var,vardecl,semi,expr,semi,expr,rb,stmt
     for@(JSForVar _ _ start cond _ mod _ expr _ loopBody) ->
-      let inits = loopBody in
-      Block ([js2ex inits])
+      let condEval = AnonymousFunction [] (Block (jse2ex <$> fromCommaList mod))
+          loopEval = AnonymousFunction [] (js2ex loopBody)
+          
+      in
+        ExpList  (foldl (\f i -> f ++ [i])
+                  (jse2ex <$> fromCommaList cond)
+                  [(FunctionCall (T.pack "loop") [condEval, loopEval])])
+        
     JSReturn _ returnValue _ ->
       case returnValue of
         Just val -> jse2ex val
         _ -> Block []
     z@(_) ->  trace ("Nothing was matched :: \n" <> show z <> "\n") (Block [])
     
-someFunc :: IO String
-someFunc = do
-  fileData <- parseFile "./test2.js"
-  parsed <- return $ case fileData of
-                       JSAstProgram items _ -> ModuleIntroduction (T.pack "Module") (Block (js2ex <$> items))
-                       _ -> ModuleIntroduction (T.pack "ModEmpty") (Block [])
-  return $ (astToEx 0 parsed)
 
 makeIndent x = intercalate "" ([" " | _ <- [1..x]])
 
@@ -224,7 +222,7 @@ astToEx indent ast =
                         <> (case rhs of
                                Just init -> " = " <> astToEx indent init
                                _ -> "")
-
+    ExpList list -> intercalate "\n" (astToEx indent <$> list)
 infixBinOpToFn op =
   case op of
     JSBinOpMod _ -> True
