@@ -32,6 +32,9 @@ data ExAST
   | Indexer ExAST ExAST
   | IndexerExpr ExAST [ExAST]
   | BinaryOp ExAST JSBinOp ExAST
+  | UnaryOp JSUnaryOp ExAST
+  | UnaryExpression JSUnaryOp ExAST
+  | BinaryExpression ExAST JSBinOp ExAST
   | Parens ExAST
   | Assignment ExAST ExAST
   | VarIntro ExAST (Maybe ExAST)
@@ -83,20 +86,23 @@ jse2ex expr =
     JSMemberDot first _ key -> Accessor (jse2ex first) (jse2ex key)
     JSMemberExpression expr _ members _ -> IndexerExpr (jse2ex expr) (jse2ex <$> (fromCommaList members))
     JSExpressionBinary lhs binOp rhs -> BinaryOp (jse2ex lhs) binOp (jse2ex rhs)
+    JSExpressionTernary cond _ trueExpr _ falseExpr -> IfElse (jse2ex cond) (jse2ex trueExpr) (jse2ex falseExpr)
+    JSUnaryExpression operator expression -> UnaryExpression operator (jse2ex expression)
+    JSExpressionBinary exp1 op exp2 -> BinaryExpression (jse2ex exp1) op (jse2ex exp2)
     JSExpressionParen _ expr _ -> Parens (jse2ex expr)
     JSFunctionExpression _ name' _ args _ body ->
-      let name = case jsIdentToName name' of
-                   Just name -> name
-                   _ -> ""
-      in 
-      NamedFunction (name) (getFnArguments args) (Block (js2ex <$> (jsBlockIfElseFlow $ getJsStatementsFromBlock body)))
+      case jsIdentToName name' of
+        Just name ->
+          NamedFunction (name) (getFnArguments args) (Block (js2ex <$> (jsBlockIfElseFlow $ getJsStatementsFromBlock body)))
+        _ -> AnonymousFunction (getFnArguments args) (Block (js2ex <$> (jsBlockIfElseFlow $ getJsStatementsFromBlock body)))
+
     JSVarInitExpression expression init' ->
       let rhs = case init' of
             JSVarInit _ expr' -> Just (jse2ex expr')
             _ -> Nothing
       in
         VarIntro (jse2ex expression) rhs
-    _ -> Block []
+    z@(_) -> trace ("Expr not matched :: " <> show z) (Block [])
 
 
 
@@ -115,14 +121,14 @@ js2ex jsAst =
           let (JSFunctionExpression f' name lb' params rb' block) = body in
             jse2ex (JSFunctionExpression f' (JSIdentName f' fnName) lb' params rb' block)
         _ -> Block []
-      --trace ("Is assignmen export :: " <> show (isAssignmentExport assign)) (Block [])
-          
+        
     JSStatementBlock _ stmts _ _ -> Block (js2ex <$> stmts)
     JSBreak _ _ _ -> Block []
     JSConstant _ list _ -> Block []
     JSIfElse _ _ expr' _  ifcond _ elseCond ->
       let expr = expr' in 
       IfElse (jse2ex expr) (js2ex ifcond) (js2ex elseCond)
+      
     call@(JSMethodCall (JSIdentifier _ fnName) a args' b c) ->
       let args = jse2ex <$> (fromCommaList args')
       in
@@ -150,41 +156,92 @@ someFunc = do
   parsed <- return $ case fileData of
                        JSAstProgram items _ -> ModuleIntroduction (T.pack "Module") (Block (js2ex <$> items))
                        _ -> ModuleIntroduction (T.pack "ModEmpty") (Block [])
-  return $ astToEx parsed 
+  return $ (astToEx 0 parsed)
 
 makeIndent x = intercalate "" ([" " | _ <- [1..x]])
 
-astToEx ast =
+newlinesIndent statements ilvl =
+  let indent = makeIndent ilvl in
+  intercalate "\n" ((indent <> ) <$> statements)
+
+squashNestedBlocks items =
+  foldl (\squashed item ->
+           case item of
+             Block items' -> squashed ++ items'
+             _ -> squashed ++ [item]
+           ) [] items
+    
+astToEx indent ast =
   case ast of
     ModuleIntroduction name rest ->
-      "defmodule " <> (T.unpack name) <> " " <> (astToEx rest)
+      "defmodule " <> (T.unpack name) <> " " <> (astToEx indent rest)
     NamedFunction name args body ->
-      "def " <> (T.unpack name) <> " " <> astToEx body
+      let
+        arguments = "(" <> (intercalate ", " (T.unpack <$> args)) <> ")"
+      in
+      "def " <> (T.unpack name) <> arguments  <> astToEx indent body
     AnonymousFunction args body ->
-      "fn -> \n" <> astToEx body
-    Block binds -> "do\n" <> (intercalate "\n" $ astToEx <$> binds) <> "\nend"
+      let renderedBody =
+            case body of
+              Block statements -> newlinesIndent ((astToEx indent) <$> squashNestedBlocks statements) (indent + 1)
+              _ -> astToEx indent body
+          arguments = "(" <> (intercalate ", " (T.unpack <$> args)) <> ")"
+      in
+        "fn" <> arguments <> " -> \n" <> renderedBody <> "\nend"
+    block@(Block binds') ->
+      let binds = squashNestedBlocks binds' in
+      "do\n" <> (newlinesIndent ((astToEx indent) <$> binds) (indent + 1)) <> "\nend"
     IfElse ifCond thens elses ->
-      "if " <> (astToEx ifCond) <> " "
-      <> astToEx thens
+      "if " <> (astToEx indent ifCond) <> " do\n"
+      <> (case thens of
+            Block stmts -> newlinesIndent ((astToEx indent) <$> stmts) (indent + 1)
+            _ -> astToEx indent thens)
       <> "\nelse\n"
-      <> astToEx elses
+      <> (case elses of
+            Block stmts -> newlinesIndent ((astToEx indent) <$> squashNestedBlocks stmts) (indent + 1)
+            _ -> (astToEx indent) elses)
+      <> "\nend"
     FunctionCall fnName args ->
-      (T.unpack fnName) <> "(" <> (intercalate ", " (astToEx <$> args)) <> ")"
+      (T.unpack fnName) <> "(" <> (intercalate ", " (astToEx indent <$> args)) <> ")"
     Number number -> T.unpack number
     Identifier ident -> T.unpack ident
     Literal literal -> T.unpack literal
     StringLiteral literal -> "\"" <> (T.unpack literal) <> "\""
-    ArrayDecl elements -> intercalate ", " (astToEx <$> elements)
-    Accessor lhs rhs -> (astToEx lhs) <> "." <> (astToEx rhs)
-    Indexer lhs rhs -> (astToEx lhs) <> "[" <> (astToEx rhs) <> "]"
-    IndexerExpr lhs arrRhs -> (astToEx lhs) <> "(" <> (intercalate ", " (astToEx <$> arrRhs)) <> ")"
+    ArrayDecl elements -> intercalate ", " (astToEx indent <$> elements)
+    Accessor lhs rhs -> (astToEx indent lhs) <> "." <> (astToEx indent rhs)
+    Indexer lhs rhs -> (astToEx indent lhs) <> "[" <> (astToEx indent rhs) <> "]"
+    IndexerExpr lhs arrRhs -> (astToEx indent lhs) <> "(" <> (intercalate ", " (astToEx indent <$> arrRhs)) <> ")"
     BinaryOp lhs op rhs ->
-      intercalate " " [(astToEx lhs), (jsBinOpMap op), (astToEx rhs)]
-    Parens ast -> "(" <> astToEx ast <> ")"
-    Assignment lhs rhs -> (astToEx lhs) <> " = " <> (astToEx rhs)
-    VarIntro var rhs -> (astToEx var) <> (case rhs of
-                                            Just init -> " = " <> astToEx init
-                                            _ -> "")
+      if infixBinOpToFn op
+      then
+        intercalate "" [(jsBinOpMap op), "(", (astToEx indent lhs), ", ", (astToEx indent rhs), ")"]
+      else
+        intercalate " " [(astToEx indent lhs), (jsBinOpMap op), (astToEx indent rhs)]
+    UnaryExpression op expr -> (jsUnaryOpMap op) <> astToEx indent expr
+    Parens ast -> "(" <> astToEx indent ast <> ")"
+    Assignment lhs rhs -> (astToEx indent lhs) <> " = " <> (astToEx indent rhs)
+    VarIntro var rhs -> (astToEx indent  var)
+                        <> (case rhs of
+                               Just init -> " = " <> astToEx indent init
+                               _ -> "")
+
+infixBinOpToFn op =
+  case op of
+    JSBinOpMod _ -> True
+    _ -> False
+
+jsUnaryOpMap op =
+  case op of
+    JSUnaryOpDecr _ -> "-"
+    JSUnaryOpDelete _ -> "delete"
+    JSUnaryOpIncr _ -> "+"
+    JSUnaryOpMinus _ -> "-"
+    JSUnaryOpNot _ -> "!"
+    JSUnaryOpPlus _ -> "+"
+    JSUnaryOpTilde _ -> "~"
+    JSUnaryOpTypeof _ -> "typeof"
+    JSUnaryOpVoid _ -> "void"
+    
 jsBinOpMap binOp =
   case binOp of
     JSBinOpAnd _ -> "and"
@@ -201,7 +258,7 @@ jsBinOpMap binOp =
     JSBinOpLsh _ -> ""
     JSBinOpLt _ -> "<"
     JSBinOpMinus _ -> "-"
-    JSBinOpMod _ ->  "%"
+    JSBinOpMod _ ->  "rem"
     JSBinOpNeq _ -> "!="
     JSBinOpOr _ -> "||"
     JSBinOpPlus _ -> "+"
